@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { io, Socket } from 'socket.io-client';
 import api from '@/lib/api';
 import { useAuth } from '@/context/AuthContext';
 import {
@@ -29,6 +30,19 @@ import {
 import type { ChatConversation, ChatMessage, LiveClass } from '@/types';
 
 type WorkspaceTab = 'whiteboard' | 'chat' | 'roster';
+
+interface LivePeer {
+  socketId: string;
+  userId: string;
+  name: string;
+  role: string;
+  cameraOn?: boolean;
+}
+
+type LiveClassSignal =
+  | { type: 'offer'; sdp: string }
+  | { type: 'answer'; sdp: string }
+  | { type: 'candidate'; candidate: RTCIceCandidateInit };
 
 const formatDateTime = (value?: string) => {
   if (!value) return '-';
@@ -76,6 +90,45 @@ const statusTone = (status?: LiveClass['status']) => {
   return 'bg-rose-100 text-rose-700 border-rose-200';
 };
 
+const getSocketBaseUrl = () => {
+  const configuredApiBase = import.meta.env.VITE_API_BASE_URL;
+  if (configuredApiBase) {
+    try {
+      const parsed = new URL(configuredApiBase);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {
+      return configuredApiBase.replace(/\/api\/?$/, '');
+    }
+  }
+
+  const configuredTarget = import.meta.env.VITE_API_PROXY_TARGET;
+  if (configuredTarget) {
+    try {
+      const parsed = new URL(configuredTarget);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {
+      return configuredTarget;
+    }
+  }
+
+  return window.location.origin;
+};
+
+const LiveVideoPlayer: React.FC<{
+  stream: MediaStream | null;
+  muted?: boolean;
+  className?: string;
+}> = ({ stream, muted = false, className = '' }) => {
+  const ref = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (!ref.current) return;
+    ref.current.srcObject = stream;
+  }, [stream]);
+
+  return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
+};
+
 export const LiveClassRoomPage: React.FC = () => {
   const { classId = '' } = useParams<{ classId: string }>();
   const navigate = useNavigate();
@@ -92,6 +145,7 @@ export const LiveClassRoomPage: React.FC = () => {
   const [cameraLoading, setCameraLoading] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
   const [cameraError, setCameraError] = useState('');
+  const [localPreviewStream, setLocalPreviewStream] = useState<MediaStream | null>(null);
 
   const [startingClass, setStartingClass] = useState(false);
   const [endingClass, setEndingClass] = useState(false);
@@ -102,9 +156,16 @@ export const LiveClassRoomPage: React.FC = () => {
   const [sendingClassChat, setSendingClassChat] = useState(false);
   const [classChatMessage, setClassChatMessage] = useState('');
 
+  const [peers, setPeers] = useState<LivePeer[]>([]);
+  const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [cameraActionStudentId, setCameraActionStudentId] = useState('');
+  const [spotlightActionStudentId, setSpotlightActionStudentId] = useState('');
+
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const classChatScrollRef = useRef<HTMLDivElement | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
 
   const fetchClassDetails = useCallback(async (silently = false) => {
     if (!classId) {
@@ -148,6 +209,298 @@ export const LiveClassRoomPage: React.FC = () => {
   const canStartClass = Boolean(isTeacher && liveClass?.status === 'scheduled');
   const canEndClass = Boolean(isTeacher && liveClass?.status === 'live');
   const canJoinClass = Boolean(!isTeacher && liveClass?.status === 'live' && liveClass?.canJoin);
+  const canPublishLocalCamera = Boolean(
+    cameraOn
+    && canAccessLiveRoom
+    && (isTeacher || liveClass?.currentUserCameraApproved)
+  );
+
+  const clearPeerConnections = useCallback(() => {
+    peerConnectionsRef.current.forEach((connection) => {
+      connection.ontrack = null;
+      connection.onicecandidate = null;
+      connection.close();
+    });
+    peerConnectionsRef.current.clear();
+    setRemoteStreams({});
+  }, []);
+
+  const createPeerConnection = useCallback((targetSocketId: string) => {
+    let connection = peerConnectionsRef.current.get(targetSocketId);
+    if (connection) return connection;
+
+    connection = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+
+    connection.onicecandidate = (event) => {
+      if (!event.candidate || !socketRef.current || !classId) return;
+
+      socketRef.current.emit('live-class:webrtc-signal', {
+        classId,
+        targetSocketId,
+        signal: {
+          type: 'candidate',
+          candidate: event.candidate.toJSON(),
+        } satisfies LiveClassSignal,
+      });
+    };
+
+    connection.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
+      setRemoteStreams((prev) => ({ ...prev, [targetSocketId]: stream }));
+    };
+
+    connection.onconnectionstatechange = () => {
+      const state = connection?.connectionState;
+      if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+        setRemoteStreams((prev) => {
+          const next = { ...prev };
+          delete next[targetSocketId];
+          return next;
+        });
+      }
+    };
+
+    peerConnectionsRef.current.set(targetSocketId, connection);
+
+    if (canPublishLocalCamera && localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        connection?.addTrack(track, localStreamRef.current as MediaStream);
+      });
+    }
+
+    return connection;
+  }, [canPublishLocalCamera, classId]);
+
+  const sendOffer = useCallback(async (peer: LivePeer) => {
+    const socket = socketRef.current;
+    if (!socket || !socket.id || !classId) return;
+    if (socket.id >= peer.socketId) return;
+
+    const connection = createPeerConnection(peer.socketId);
+    if (connection.signalingState !== 'stable') return;
+
+    try {
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+
+      socket.emit('live-class:webrtc-signal', {
+        classId,
+        targetSocketId: peer.socketId,
+        signal: {
+          type: 'offer',
+          sdp: offer.sdp || '',
+        } satisfies LiveClassSignal,
+      });
+    } catch {
+      // Ignore transient offer errors while peers reconnect.
+    }
+  }, [classId, createPeerConnection]);
+
+  const syncParticipants = useCallback((incoming: LivePeer[]) => {
+    const currentSocketId = socketRef.current?.id;
+    const normalized = Array.isArray(incoming)
+      ? incoming
+          .filter((peer) => peer?.socketId && peer.socketId !== currentSocketId)
+          .map((peer) => ({
+            ...peer,
+            cameraOn: Boolean(peer.cameraOn),
+          }))
+      : [];
+
+    setPeers(normalized);
+
+    normalized.forEach((peer) => {
+      void sendOffer(peer);
+    });
+  }, [sendOffer]);
+
+  const handleSignal = useCallback(async (payload: {
+    fromSocketId?: string;
+    fromUserId?: string;
+    signal?: LiveClassSignal;
+  }) => {
+    const fromSocketId = String(payload.fromSocketId || '').trim();
+    const signal = payload.signal;
+    if (!fromSocketId || !signal || !classId) return;
+
+    const connection = createPeerConnection(fromSocketId);
+
+    try {
+      if (signal.type === 'offer') {
+        await connection.setRemoteDescription({ type: 'offer', sdp: signal.sdp });
+        const answer = await connection.createAnswer();
+        await connection.setLocalDescription(answer);
+
+        socketRef.current?.emit('live-class:webrtc-signal', {
+          classId,
+          targetSocketId: fromSocketId,
+          signal: {
+            type: 'answer',
+            sdp: answer.sdp || '',
+          } satisfies LiveClassSignal,
+        });
+        return;
+      }
+
+      if (signal.type === 'answer') {
+        await connection.setRemoteDescription({ type: 'answer', sdp: signal.sdp });
+        return;
+      }
+
+      if (signal.type === 'candidate') {
+        await connection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      }
+    } catch {
+      // Ignore signaling race conditions during reconnect.
+    }
+  }, [classId, createPeerConnection]);
+
+  useEffect(() => {
+    if (!classId || !user?._id) return;
+
+    const socket = io(getSocketBaseUrl(), {
+      withCredentials: true,
+      transports: ['websocket', 'polling'],
+    });
+
+    socketRef.current = socket;
+
+    const joinLiveRoom = () => {
+      socket.emit('join-live-class', {
+        classId,
+        userId: user._id,
+        name: user.name,
+        role: user.role,
+      });
+
+      socket.emit('live-class:camera-state', {
+        classId,
+        cameraOn: canPublishLocalCamera,
+      });
+    };
+
+    const handlePresence = (event: {
+      type?: string;
+      socketId?: string;
+      userId?: string;
+      name?: string;
+      role?: string;
+    }) => {
+      const socketId = String(event.socketId || '').trim();
+      if (!socketId || socketId === socket.id) return;
+
+      if (event.type === 'left') {
+        setPeers((prev) => prev.filter((peer) => peer.socketId !== socketId));
+        setRemoteStreams((prev) => {
+          const next = { ...prev };
+          delete next[socketId];
+          return next;
+        });
+
+        const connection = peerConnectionsRef.current.get(socketId);
+        if (connection) {
+          connection.close();
+          peerConnectionsRef.current.delete(socketId);
+        }
+        return;
+      }
+
+      const joinedPeer: LivePeer = {
+        socketId,
+        userId: String(event.userId || ''),
+        name: String(event.name || 'User'),
+        role: String(event.role || 'student'),
+        cameraOn: false,
+      };
+
+      setPeers((prev) => {
+        const exists = prev.some((peer) => peer.socketId === socketId);
+        return exists ? prev : [...prev, joinedPeer];
+      });
+
+      void sendOffer(joinedPeer);
+    };
+
+    const handlePeerCameraState = (payload: {
+      socketId?: string;
+      cameraOn?: boolean;
+    }) => {
+      const socketId = String(payload.socketId || '').trim();
+      if (!socketId) return;
+
+      setPeers((prev) => prev.map((peer) => (
+        peer.socketId === socketId ? { ...peer, cameraOn: Boolean(payload.cameraOn) } : peer
+      )));
+    };
+
+    socket.on('connect', joinLiveRoom);
+    socket.on('live-class:participants', syncParticipants);
+    socket.on('live-class:presence', handlePresence);
+    socket.on('live-class:webrtc-signal', (payload) => {
+      void handleSignal(payload);
+    });
+    socket.on('live-class:camera-state', handlePeerCameraState);
+    socket.on('live-class:settings-updated', () => {
+      void fetchClassDetails(true);
+    });
+
+    if (socket.connected) {
+      joinLiveRoom();
+    }
+
+    return () => {
+      socket.emit('leave-live-class');
+      socket.off('connect', joinLiveRoom);
+      socket.off('live-class:participants', syncParticipants);
+      socket.off('live-class:presence', handlePresence);
+      socket.off('live-class:webrtc-signal');
+      socket.off('live-class:camera-state', handlePeerCameraState);
+      socket.off('live-class:settings-updated');
+      socket.disconnect();
+      socketRef.current = null;
+
+      clearPeerConnections();
+      setPeers([]);
+      setRemoteStreams({});
+    };
+  }, [
+    canPublishLocalCamera,
+    classId,
+    clearPeerConnections,
+    fetchClassDetails,
+    handleSignal,
+    syncParticipants,
+    user?._id,
+    user?.name,
+    user?.role,
+  ]);
+
+  useEffect(() => {
+    if (!socketRef.current || !socketRef.current.connected || !classId) return;
+
+    socketRef.current.emit('live-class:camera-state', {
+      classId,
+      cameraOn: canPublishLocalCamera,
+    });
+
+    clearPeerConnections();
+    socketRef.current.emit('join-live-class', {
+      classId,
+      userId: user?._id,
+      name: user?.name,
+      role: user?.role,
+    });
+  }, [
+    canPublishLocalCamera,
+    classId,
+    clearPeerConnections,
+    user?._id,
+    user?.name,
+    user?.role,
+  ]);
 
   const whiteboardUrl = useMemo(() => {
     if (!liveClass || !canAccessLiveRoom) return '';
@@ -171,6 +524,7 @@ export const LiveClassRoomPage: React.FC = () => {
       localVideoRef.current.srcObject = null;
     }
 
+    setLocalPreviewStream(null);
     setCameraOn(false);
   }, []);
 
@@ -191,6 +545,7 @@ export const LiveClassRoomPage: React.FC = () => {
       }
 
       localStreamRef.current = stream;
+      setLocalPreviewStream(stream);
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -204,6 +559,14 @@ export const LiveClassRoomPage: React.FC = () => {
       setCameraLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (isTeacher) return;
+    if (!cameraOn || liveClass?.currentUserCameraApproved) return;
+
+    stopCamera();
+    toast('Teacher has revoked your camera permission.', 'info');
+  }, [cameraOn, isTeacher, liveClass?.currentUserCameraApproved, stopCamera]);
 
   useEffect(() => {
     return () => {
@@ -362,6 +725,75 @@ export const LiveClassRoomPage: React.FC = () => {
       setEndingClass(false);
     }
   };
+
+  const grantStudentCamera = async (studentId: string) => {
+    if (!classId) return;
+    setCameraActionStudentId(studentId);
+
+    try {
+      await api.post(`/live-classes/${classId}/participants/${studentId}/camera/grant`);
+      toast('Camera permission granted.', 'success');
+      await fetchClassDetails(true);
+    } catch (error: unknown) {
+      const message = (error as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      toast(message || 'Unable to grant camera permission.', 'error');
+    } finally {
+      setCameraActionStudentId('');
+    }
+  };
+
+  const revokeStudentCamera = async (studentId: string) => {
+    if (!classId) return;
+    setCameraActionStudentId(studentId);
+
+    try {
+      await api.post(`/live-classes/${classId}/participants/${studentId}/camera/revoke`);
+      toast('Camera permission revoked.', 'success');
+      await fetchClassDetails(true);
+    } catch (error: unknown) {
+      const message = (error as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      toast(message || 'Unable to revoke camera permission.', 'error');
+    } finally {
+      setCameraActionStudentId('');
+    }
+  };
+
+  const updateSpotlight = async (studentId: string | null) => {
+    if (!classId) return;
+    setSpotlightActionStudentId(studentId || 'none');
+
+    try {
+      await api.post(`/live-classes/${classId}/spotlight`, { studentId });
+      toast(studentId ? 'Student spotlight enabled.' : 'Student spotlight cleared.', 'success');
+      await fetchClassDetails(true);
+    } catch (error: unknown) {
+      const message = (error as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      toast(message || 'Unable to update spotlight.', 'error');
+    } finally {
+      setSpotlightActionStudentId('');
+    }
+  };
+
+  const teacherPeer = useMemo(
+    () => peers.find((peer) => (
+      (peer.role === 'teacher' || peer.role === 'admin')
+      && Boolean(remoteStreams[peer.socketId])
+    )) || peers.find((peer) => (peer.role === 'teacher' || peer.role === 'admin')) || null,
+    [peers, remoteStreams]
+  );
+
+  const teacherStream = teacherPeer ? remoteStreams[teacherPeer.socketId] || null : null;
+
+  const spotlightPeer = useMemo(() => {
+    const spotlightUserId = liveClass?.spotlightStudent?._id;
+    if (!spotlightUserId) return null;
+
+    return peers.find((peer) => (
+      peer.userId === spotlightUserId && Boolean(remoteStreams[peer.socketId])
+    )) || peers.find((peer) => peer.userId === spotlightUserId) || null;
+  }, [liveClass?.spotlightStudent?._id, peers, remoteStreams]);
+
+  const spotlightStream = spotlightPeer ? remoteStreams[spotlightPeer.socketId] || null : null;
 
   if (loadingClass) {
     return (
@@ -561,24 +993,93 @@ export const LiveClassRoomPage: React.FC = () => {
                 ) : (
                   <div className="max-h-[440px] overflow-y-auto grid md:grid-cols-2 gap-2 pr-1">
                     {roster.map((participant) => {
+                      const student = participant.student;
+                      if (!student?._id) return null;
+
                       const isPresent = Boolean(participant.joinedAt);
+                      const isApproved = Boolean(participant.cameraApproved);
+                      const isSpotlighted = Boolean(
+                        liveClass.spotlightStudent?._id
+                        && liveClass.spotlightStudent._id === student._id
+                      );
+
                       return (
-                        <div key={participant.student._id} className="flex items-center justify-between gap-2 rounded-lg bg-white border border-slate-200 px-3 py-2">
-                          <div className="flex items-center gap-2 min-w-0">
-                            <Avatar
-                              name={participant.student.name}
-                              src={participant.student.avatar}
-                              size="sm"
-                              className="!bg-slate-200 !text-slate-700"
-                            />
-                            <div className="min-w-0">
-                              <p className="text-sm font-medium text-slate-900 truncate">{participant.student.name}</p>
-                              <p className="text-[11px] text-slate-500">Registered {formatRelative(participant.registeredAt, nowMs)}</p>
+                        <div key={student._id} className="rounded-lg bg-white border border-slate-200 px-3 py-2 space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <Avatar
+                                name={student.name}
+                                src={student.avatar}
+                                size="sm"
+                                className="!bg-slate-200 !text-slate-700"
+                              />
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-slate-900 truncate">{student.name}</p>
+                                <p className="text-[11px] text-slate-500">Registered {formatRelative(participant.registeredAt, nowMs)}</p>
+                              </div>
                             </div>
+
+                            <span className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold ${isPresent ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'}`}>
+                              {isPresent ? 'Present' : 'Waiting'}
+                            </span>
                           </div>
-                          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold ${isPresent ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'}`}>
-                            {isPresent ? 'Present' : 'Waiting'}
-                          </span>
+
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold ${isApproved ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
+                              {isApproved ? 'Camera approved' : 'Camera blocked'}
+                            </span>
+
+                            {isSpotlighted && (
+                              <span className="inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold bg-amber-100 text-amber-800">
+                                Spotlight
+                              </span>
+                            )}
+                          </div>
+
+                          {isTeacher && (
+                            <div className="flex items-center gap-2 flex-wrap">
+                              {isApproved ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  loading={cameraActionStudentId === student._id}
+                                  onClick={() => revokeStudentCamera(student._id)}
+                                >
+                                  Revoke Camera
+                                </Button>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  loading={cameraActionStudentId === student._id}
+                                  onClick={() => grantStudentCamera(student._id)}
+                                >
+                                  Grant Camera
+                                </Button>
+                              )}
+
+                              {isSpotlighted ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  loading={spotlightActionStudentId === 'none'}
+                                  onClick={() => updateSpotlight(null)}
+                                >
+                                  Clear Spotlight
+                                </Button>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={!isApproved}
+                                  loading={spotlightActionStudentId === student._id}
+                                  onClick={() => updateSpotlight(student._id)}
+                                >
+                                  Spotlight Student
+                                </Button>
+                              )}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -591,25 +1092,62 @@ export const LiveClassRoomPage: React.FC = () => {
 
         <Card className="border-slate-200">
           <CardHeader>
-            <h3 className="font-sans text-sm font-semibold">Teacher Screen</h3>
-            <p className="text-xs text-muted-foreground">Video remains fixed while you switch whiteboard/chat/roster on the left.</p>
+            <h3 className="font-sans text-sm font-semibold">Live Video Stage</h3>
+            <p className="text-xs text-muted-foreground">Students can see teacher camera and teacher-selected student spotlight.</p>
           </CardHeader>
           <CardBody className="space-y-3">
             <div className="h-[220px] rounded-lg border border-border bg-slate-900 relative overflow-hidden">
-              <video
-                ref={localVideoRef}
-                autoPlay
-                muted
-                playsInline
-                className={`h-full w-full object-cover ${cameraOn ? 'block' : 'hidden'}`}
-              />
+              {isTeacher ? (
+                <>
+                  <video
+                    ref={localVideoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    className={`h-full w-full object-cover ${cameraOn ? 'block' : 'hidden'}`}
+                  />
 
-              {!cameraOn && (
+                  {!cameraOn && (
+                    <div className="h-full w-full flex items-center justify-center text-sm text-slate-300">
+                      Camera is off.
+                    </div>
+                  )}
+                </>
+              ) : teacherStream ? (
+                <LiveVideoPlayer stream={teacherStream} className="h-full w-full object-cover" />
+              ) : (
                 <div className="h-full w-full flex items-center justify-center text-sm text-slate-300">
-                  Camera is off.
+                  Waiting for teacher camera.
                 </div>
               )}
             </div>
+
+            {!isTeacher && (
+              <div className="h-[110px] rounded-lg border border-border bg-slate-900 relative overflow-hidden">
+                {localPreviewStream ? (
+                  <LiveVideoPlayer stream={localPreviewStream} muted className="h-full w-full object-cover" />
+                ) : (
+                  <div className="h-full w-full flex items-center justify-center text-xs text-slate-300">
+                    Your camera preview
+                  </div>
+                )}
+              </div>
+            )}
+
+            {liveClass.spotlightStudent && (
+              <div className="space-y-1">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Student Spotlight</p>
+                <div className="h-[140px] rounded-lg border border-border bg-slate-900 relative overflow-hidden">
+                  {spotlightStream ? (
+                    <LiveVideoPlayer stream={spotlightStream} className="h-full w-full object-cover" />
+                  ) : (
+                    <div className="h-full w-full flex items-center justify-center text-xs text-slate-300 px-3 text-center">
+                      Waiting for {liveClass.spotlightStudent.name}'s camera stream.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
 
             {cameraError && <Alert variant="warning">{cameraError}</Alert>}
 
@@ -626,6 +1164,7 @@ export const LiveClassRoomPage: React.FC = () => {
               <p>Duration: {liveClass.durationMinutes} min</p>
               <p>Meeting code: {liveClass.meetingCode}</p>
               <p>Present: {liveClass.joinedCount} / {liveClass.registeredCount}</p>
+              <p>Peer streams: {Object.keys(remoteStreams).length}</p>
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -637,6 +1176,11 @@ export const LiveClassRoomPage: React.FC = () => {
                 onClick={() => {
                   if (!canAccessLiveRoom && !cameraOn) {
                     toast('Camera is available after class goes live.', 'info');
+                    return;
+                  }
+
+                   if (!isTeacher && !liveClass.currentUserCameraApproved && !cameraOn) {
+                    toast('Teacher has not granted your camera permission yet.', 'info');
                     return;
                   }
 

@@ -120,6 +120,43 @@ app.get('/api/health', (_req, res) => {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
+  const getLiveClassParticipants = (classId) => {
+    const roomName = `live-class:${classId}`;
+    const room = io.sockets.adapter.rooms.get(roomName);
+    if (!room) return [];
+
+    return Array.from(room)
+      .map((socketId) => {
+        const peer = io.sockets.sockets.get(socketId);
+        const meta = peer?.data?.liveClassMeta;
+        if (!meta) return null;
+
+        return {
+          socketId,
+          userId: String(meta.userId),
+          name: meta.name || 'User',
+          role: meta.role || 'student',
+        };
+      })
+      .filter(Boolean);
+  };
+
+  const leaveLiveClass = () => {
+    const meta = socket.data.liveClassMeta;
+    if (!meta?.classId) return;
+
+    const roomName = `live-class:${meta.classId}`;
+    socket.leave(roomName);
+
+    io.to(roomName).emit('live-class:presence', {
+      type: 'left',
+      socketId: socket.id,
+      userId: String(meta.userId),
+    });
+
+    socket.data.liveClassMeta = null;
+  };
+
   socket.on('join-user', (userId) => {
     if (!userId) return;
     socket.join(`user:${userId}`);
@@ -146,7 +183,67 @@ io.on('connection', (socket) => {
     socket.leave(`chat:${chatId}`);
   });
 
+  socket.on('join-live-class', (payload = {}) => {
+    const classId = String(payload.classId || '').trim();
+    const userId = String(payload.userId || '').trim();
+
+    if (!classId || !userId) return;
+
+    leaveLiveClass();
+
+    const roomName = `live-class:${classId}`;
+    socket.join(roomName);
+    socket.join(`live-user:${userId}`);
+
+    socket.data.liveClassMeta = {
+      classId,
+      userId,
+      name: String(payload.name || 'User').trim(),
+      role: String(payload.role || 'student').trim(),
+    };
+
+    socket.emit('live-class:participants', getLiveClassParticipants(classId));
+
+    io.to(roomName).emit('live-class:presence', {
+      type: 'joined',
+      socketId: socket.id,
+      userId,
+      name: socket.data.liveClassMeta.name,
+      role: socket.data.liveClassMeta.role,
+    });
+  });
+
+  socket.on('leave-live-class', () => {
+    leaveLiveClass();
+  });
+
+  socket.on('live-class:webrtc-signal', (payload = {}) => {
+    const classId = String(payload.classId || '').trim();
+    const targetSocketId = String(payload.targetSocketId || '').trim();
+    if (!classId || !targetSocketId || !payload.signal) return;
+
+    io.to(targetSocketId).emit('live-class:webrtc-signal', {
+      classId,
+      fromSocketId: socket.id,
+      fromUserId: String(socket.data.liveClassMeta?.userId || ''),
+      signal: payload.signal,
+    });
+  });
+
+  socket.on('live-class:camera-state', (payload = {}) => {
+    const classId = String(payload.classId || '').trim();
+    if (!classId) return;
+
+    io.to(`live-class:${classId}`).emit('live-class:camera-state', {
+      classId,
+      socketId: socket.id,
+      userId: String(socket.data.liveClassMeta?.userId || ''),
+      cameraOn: Boolean(payload.cameraOn),
+    });
+  });
+
   socket.on('disconnect', () => {
+    leaveLiveClass();
     console.log('Client disconnected:', socket.id);
   });
 });

@@ -15,6 +15,14 @@ const liveClassParticipantSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    cameraApproved: {
+      type: Boolean,
+      default: false,
+    },
+    cameraApprovedAt: {
+      type: Date,
+      default: null,
+    },
   },
   { _id: false }
 );
@@ -74,6 +82,11 @@ const liveClassSchema = new mongoose.Schema(
     },
     endedAt: {
       type: Date,
+      default: null,
+    },
+    spotlightStudent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
       default: null,
     },
     participants: [liveClassParticipantSchema],

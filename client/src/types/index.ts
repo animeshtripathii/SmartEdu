@@ -228,6 +228,8 @@ export interface LiveClassParticipant {
   student: Pick<User, '_id' | 'name' | 'avatar'>;
   registeredAt: string;
   joinedAt?: string | null;
+  cameraApproved?: boolean;
+  cameraApprovedAt?: string | null;
 }
 
 export interface LiveClass {
@@ -245,6 +247,8 @@ export interface LiveClass {
   joinedCount: number;
   isRegistered: boolean;
   canJoin: boolean;
+  currentUserCameraApproved?: boolean;
+  spotlightStudent?: Pick<User, '_id' | 'name' | 'avatar' | 'role'> | null;
   startedAt?: string | null;
   endedAt?: string | null;
   createdAt: string;

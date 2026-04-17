@@ -56,17 +56,22 @@ const ensureCourseGroupChat = async ({ courseId, courseTitle, teacherId, student
 const serializeClass = (liveClass, currentUserId) => {
   const serialized = liveClass.toObject();
   const participants = serialized.participants || [];
+  const teacherId = serialized.teacher?._id || serialized.teacher;
 
-  const isRegistered = participants.some(
+  const currentParticipant = participants.find(
     (participant) => String(participant.student?._id || participant.student) === String(currentUserId)
   );
+  const isRegistered = Boolean(currentParticipant);
   const joinedCount = participants.filter((participant) => Boolean(participant.joinedAt)).length;
+  const currentUserCameraApproved = String(teacherId) === String(currentUserId)
+    || Boolean(currentParticipant?.cameraApproved);
 
   return {
     ...serialized,
     registeredCount: participants.length,
     joinedCount,
     isRegistered,
+    currentUserCameraApproved,
     canJoin: serialized.status === 'live' && (isRegistered || String(serialized.teacher?._id || serialized.teacher) === String(currentUserId)),
   };
 };
@@ -93,6 +98,7 @@ router.get('/', protect, async (req, res, next) => {
       .populate('course', 'title instructor banner thumbnail')
       .populate('teacher', 'name avatar')
       .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role')
       .sort({ scheduledAt: 1, createdAt: -1 })
       .limit(120);
 
@@ -187,7 +193,8 @@ router.post('/schedule', protect, restrictTo('teacher', 'admin'), async (req, re
     const populated = await LiveClass.findById(liveClass._id)
       .populate('course', 'title instructor banner thumbnail')
       .populate('teacher', 'name avatar')
-      .populate('participants.student', 'name avatar');
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
 
     res.status(201).json({
       liveClass: serializeClass(populated, req.user._id),
@@ -207,7 +214,8 @@ router.post('/:id/start', protect, restrictTo('teacher', 'admin'), async (req, r
     const liveClass = await LiveClass.findById(req.params.id)
       .populate('course', 'title instructor')
       .populate('teacher', 'name avatar')
-      .populate('participants.student', 'name avatar');
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
 
     if (!liveClass) {
       return res.status(404).json({ error: 'Live class not found.' });
@@ -253,7 +261,8 @@ router.post('/:id/start', protect, restrictTo('teacher', 'admin'), async (req, r
     const refreshed = await LiveClass.findById(liveClass._id)
       .populate('course', 'title instructor banner thumbnail')
       .populate('teacher', 'name avatar')
-      .populate('participants.student', 'name avatar');
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
 
     res.json({
       liveClass: serializeClass(refreshed, req.user._id),
@@ -329,6 +338,181 @@ router.post('/:id/join', protect, async (req, res, next) => {
       message: 'Joined live class.',
       liveClassId: liveClass._id,
       meetingCode: liveClass.meetingCode,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:id/participants/:studentId/camera/grant', protect, restrictTo('teacher', 'admin'), async (req, res, next) => {
+  try {
+    if (!isValidObjectId(req.params.id) || !isValidObjectId(req.params.studentId)) {
+      return res.status(400).json({ error: 'Invalid live class or student ID.' });
+    }
+
+    const liveClass = await LiveClass.findById(req.params.id)
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar role')
+      .populate('spotlightStudent', 'name avatar role');
+
+    if (!liveClass) {
+      return res.status(404).json({ error: 'Live class not found.' });
+    }
+
+    if (req.user.role !== 'admin' && String(liveClass.teacher._id || liveClass.teacher) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'Only the class teacher can grant camera access.' });
+    }
+
+    const participantIndex = liveClass.participants.findIndex(
+      (participant) => String(participant.student?._id || participant.student) === String(req.params.studentId)
+    );
+
+    if (participantIndex < 0) {
+      return res.status(404).json({ error: 'Student is not registered for this class.' });
+    }
+
+    liveClass.participants[participantIndex].cameraApproved = true;
+    liveClass.participants[participantIndex].cameraApprovedAt = new Date();
+    await liveClass.save();
+
+    req.io.to(`live-class:${liveClass._id}`).emit('live-class:settings-updated', {
+      liveClassId: String(liveClass._id),
+      type: 'camera-granted',
+      studentId: String(req.params.studentId),
+    });
+
+    const refreshed = await LiveClass.findById(liveClass._id)
+      .populate('course', 'title instructor banner thumbnail')
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
+
+    res.json({
+      message: 'Student camera permission granted.',
+      liveClass: serializeClass(refreshed, req.user._id),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:id/participants/:studentId/camera/revoke', protect, restrictTo('teacher', 'admin'), async (req, res, next) => {
+  try {
+    if (!isValidObjectId(req.params.id) || !isValidObjectId(req.params.studentId)) {
+      return res.status(400).json({ error: 'Invalid live class or student ID.' });
+    }
+
+    const liveClass = await LiveClass.findById(req.params.id)
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar role')
+      .populate('spotlightStudent', 'name avatar role');
+
+    if (!liveClass) {
+      return res.status(404).json({ error: 'Live class not found.' });
+    }
+
+    if (req.user.role !== 'admin' && String(liveClass.teacher._id || liveClass.teacher) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'Only the class teacher can revoke camera access.' });
+    }
+
+    const participantIndex = liveClass.participants.findIndex(
+      (participant) => String(participant.student?._id || participant.student) === String(req.params.studentId)
+    );
+
+    if (participantIndex < 0) {
+      return res.status(404).json({ error: 'Student is not registered for this class.' });
+    }
+
+    liveClass.participants[participantIndex].cameraApproved = false;
+    liveClass.participants[participantIndex].cameraApprovedAt = null;
+
+    if (String(liveClass.spotlightStudent || '') === String(req.params.studentId)) {
+      liveClass.spotlightStudent = null;
+    }
+
+    await liveClass.save();
+
+    req.io.to(`live-class:${liveClass._id}`).emit('live-class:settings-updated', {
+      liveClassId: String(liveClass._id),
+      type: 'camera-revoked',
+      studentId: String(req.params.studentId),
+    });
+
+    const refreshed = await LiveClass.findById(liveClass._id)
+      .populate('course', 'title instructor banner thumbnail')
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
+
+    res.json({
+      message: 'Student camera permission revoked.',
+      liveClass: serializeClass(refreshed, req.user._id),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:id/spotlight', protect, restrictTo('teacher', 'admin'), async (req, res, next) => {
+  try {
+    if (!isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid live class ID.' });
+    }
+
+    const { studentId = null } = req.body;
+
+    if (studentId !== null && !isValidObjectId(studentId)) {
+      return res.status(400).json({ error: 'Invalid student ID.' });
+    }
+
+    const liveClass = await LiveClass.findById(req.params.id)
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar role')
+      .populate('spotlightStudent', 'name avatar role');
+
+    if (!liveClass) {
+      return res.status(404).json({ error: 'Live class not found.' });
+    }
+
+    if (req.user.role !== 'admin' && String(liveClass.teacher._id || liveClass.teacher) !== String(req.user._id)) {
+      return res.status(403).json({ error: 'Only the class teacher can set spotlight camera.' });
+    }
+
+    if (studentId === null) {
+      liveClass.spotlightStudent = null;
+    } else {
+      const participant = liveClass.participants.find(
+        (item) => String(item.student?._id || item.student) === String(studentId)
+      );
+
+      if (!participant) {
+        return res.status(404).json({ error: 'Student is not registered for this class.' });
+      }
+
+      if (!participant.cameraApproved) {
+        return res.status(400).json({ error: 'Grant camera permission before spotlighting this student.' });
+      }
+
+      liveClass.spotlightStudent = studentId;
+    }
+
+    await liveClass.save();
+
+    req.io.to(`live-class:${liveClass._id}`).emit('live-class:settings-updated', {
+      liveClassId: String(liveClass._id),
+      type: 'spotlight-updated',
+      studentId: studentId ? String(studentId) : null,
+    });
+
+    const refreshed = await LiveClass.findById(liveClass._id)
+      .populate('course', 'title instructor banner thumbnail')
+      .populate('teacher', 'name avatar')
+      .populate('participants.student', 'name avatar')
+      .populate('spotlightStudent', 'name avatar role');
+
+    res.json({
+      message: 'Spotlight updated.',
+      liveClass: serializeClass(refreshed, req.user._id),
     });
   } catch (error) {
     next(error);
