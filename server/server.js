@@ -96,8 +96,8 @@ app.use((req, _res, next) => {
 });
 
 // API Routes
-app.use('/', function (req, res, next) {
-  return res.json({message:'Api is running!'});
+app.get('/', (_req, res) => {
+  res.json({ message: 'Api is running!' });
 });
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
