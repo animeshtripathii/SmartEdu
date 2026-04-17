@@ -18,6 +18,7 @@ import {
 import {
   ArrowLeft,
   Clock3,
+  Hand,
   MessageSquare,
   PlayCircle,
   Radio,
@@ -225,6 +226,33 @@ export const LiveClassRoomPage: React.FC = () => {
     setRemoteStreams({});
   }, []);
 
+  const syncConnectionLocalTracks = useCallback((connection: RTCPeerConnection) => {
+    const senders = connection.getSenders();
+
+    if (!canPublishLocalCamera || !localStreamRef.current) {
+      senders.forEach((sender) => {
+        if (!sender.track) return;
+        void sender.replaceTrack(null).catch(() => {
+          // Ignore sender replacement issues during reconnect.
+        });
+      });
+      return;
+    }
+
+    const stream = localStreamRef.current;
+    stream.getTracks().forEach((track) => {
+      const existingSender = senders.find((sender) => sender.track?.kind === track.kind);
+      if (existingSender) {
+        void existingSender.replaceTrack(track).catch(() => {
+          // Ignore sender replacement issues during reconnect.
+        });
+        return;
+      }
+
+      connection.addTrack(track, stream);
+    });
+  }, [canPublishLocalCamera]);
+
   const createPeerConnection = useCallback((targetSocketId: string) => {
     let connection = peerConnectionsRef.current.get(targetSocketId);
     if (connection) return connection;
@@ -264,15 +292,10 @@ export const LiveClassRoomPage: React.FC = () => {
     };
 
     peerConnectionsRef.current.set(targetSocketId, connection);
-
-    if (canPublishLocalCamera && localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        connection?.addTrack(track, localStreamRef.current as MediaStream);
-      });
-    }
+    syncConnectionLocalTracks(connection);
 
     return connection;
-  }, [canPublishLocalCamera, classId]);
+  }, [classId, syncConnectionLocalTracks]);
 
   const sendOffer = useCallback(async (peer: LivePeer) => {
     const socket = socketRef.current;
@@ -280,6 +303,7 @@ export const LiveClassRoomPage: React.FC = () => {
     if (socket.id >= peer.socketId) return;
 
     const connection = createPeerConnection(peer.socketId);
+    syncConnectionLocalTracks(connection);
     if (connection.signalingState !== 'stable') return;
 
     try {
@@ -297,7 +321,7 @@ export const LiveClassRoomPage: React.FC = () => {
     } catch {
       // Ignore transient offer errors while peers reconnect.
     }
-  }, [classId, createPeerConnection]);
+  }, [classId, createPeerConnection, syncConnectionLocalTracks]);
 
   const syncParticipants = useCallback((incoming: LivePeer[]) => {
     const currentSocketId = socketRef.current?.id;
@@ -327,6 +351,7 @@ export const LiveClassRoomPage: React.FC = () => {
     if (!fromSocketId || !signal || !classId) return;
 
     const connection = createPeerConnection(fromSocketId);
+    syncConnectionLocalTracks(connection);
 
     try {
       if (signal.type === 'offer') {
@@ -356,7 +381,7 @@ export const LiveClassRoomPage: React.FC = () => {
     } catch {
       // Ignore signaling race conditions during reconnect.
     }
-  }, [classId, createPeerConnection]);
+  }, [classId, createPeerConnection, syncConnectionLocalTracks]);
 
   useEffect(() => {
     if (!classId || !user?._id) return;
@@ -486,20 +511,16 @@ export const LiveClassRoomPage: React.FC = () => {
       cameraOn: canPublishLocalCamera,
     });
 
-    clearPeerConnections();
-    socketRef.current.emit('join-live-class', {
-      classId,
-      userId: user?._id,
-      name: user?.name,
-      role: user?.role,
-    });
+    if (canPublishLocalCamera) {
+      peers.forEach((peer) => {
+        void sendOffer(peer);
+      });
+    }
   }, [
     canPublishLocalCamera,
     classId,
-    clearPeerConnections,
-    user?._id,
-    user?.name,
-    user?.role,
+    peers,
+    sendOffer,
   ]);
 
   const whiteboardUrl = useMemo(() => {
@@ -1014,7 +1035,10 @@ export const LiveClassRoomPage: React.FC = () => {
                                 className="!bg-slate-200 !text-slate-700"
                               />
                               <div className="min-w-0">
-                                <p className="text-sm font-medium text-slate-900 truncate">{student.name}</p>
+                                <div className="flex items-center gap-1 min-w-0">
+                                  <p className="text-sm font-medium text-slate-900 truncate">{student.name}</p>
+                                  {isSpotlighted && <Hand size={12} className="text-amber-600 shrink-0" />}
+                                </div>
                                 <p className="text-[11px] text-slate-500">Registered {formatRelative(participant.registeredAt, nowMs)}</p>
                               </div>
                             </div>
@@ -1028,12 +1052,6 @@ export const LiveClassRoomPage: React.FC = () => {
                             <span className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold ${isApproved ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-600'}`}>
                               {isApproved ? 'Camera approved' : 'Camera blocked'}
                             </span>
-
-                            {isSpotlighted && (
-                              <span className="inline-flex items-center rounded-full px-2 py-1 text-[11px] font-semibold bg-amber-100 text-amber-800">
-                                Spotlight
-                              </span>
-                            )}
                           </div>
 
                           {isTeacher && (
