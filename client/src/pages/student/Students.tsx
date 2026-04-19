@@ -136,6 +136,7 @@ export const StudentsPage: React.FC = () => {
                 label="Search students"
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => event.key === 'Enter' && loadStudents(search)}
                 placeholder="Name or email"
                 icon={<Search size={14} />}
               />

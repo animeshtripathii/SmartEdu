@@ -8,6 +8,8 @@ const {
 } = require('../models/index');
 const { awardEligibleBadges } = require('../utils/gamification');
 
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const normalizeStringArray = (value) => {
   if (!Array.isArray(value)) return [];
   return value.map((item) => String(item).trim()).filter(Boolean);
@@ -117,23 +119,34 @@ exports.getCourses = async (req, res, next) => {
       limit = 12,
       sort = '-createdAt',
     } = req.query;
+    const normalizedSearch = String(search || '').trim();
+    const pageNumber = Math.max(Number.parseInt(String(page), 10) || 1, 1);
+    const pageLimit = Math.min(Math.max(Number.parseInt(String(limit), 10) || 12, 1), 50);
+    const sortValue = String(sort || '').trim() || '-createdAt';
 
     const query = { isPublished: true };
 
-    if (search) {
-      query.$text = { $search: search };
+    if (normalizedSearch) {
+      const searchRegex = new RegExp(escapeRegex(normalizedSearch), 'i');
+      query.$or = [
+        { title: searchRegex },
+        { description: searchRegex },
+        { content: searchRegex },
+        { category: searchRegex },
+        { tags: searchRegex },
+      ];
     }
     if (category) query.category = category;
     if (difficulty) query.difficulty = difficulty;
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (pageNumber - 1) * pageLimit;
 
     const [courses, total] = await Promise.all([
       Course.find(query)
         .populate('instructor', 'name avatar')
-        .sort(sort)
+        .sort(sortValue)
         .skip(skip)
-        .limit(parseInt(limit))
+        .limit(pageLimit)
         .select('-modules'),
       Course.countDocuments(query),
     ]);
@@ -142,9 +155,9 @@ exports.getCourses = async (req, res, next) => {
       courses,
       pagination: {
         total,
-        page: parseInt(page),
-        pages: Math.ceil(total / parseInt(limit)),
-        limit: parseInt(limit),
+        page: pageNumber,
+        pages: Math.ceil(total / pageLimit),
+        limit: pageLimit,
       },
     });
   } catch (err) {

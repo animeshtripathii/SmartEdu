@@ -120,13 +120,19 @@ export const CourseCatalog: React.FC = () => {
   const [difficulty, setDifficulty] = useState('All');
   const [pagination, setPagination] = useState({ page: 1, pages: 1, total: 0 });
 
-  const fetchCourses = async (page = 1) => {
+  const fetchCourses = async (
+    page = 1,
+    overrides?: { search?: string; category?: string; difficulty?: string }
+  ) => {
     setLoading(true);
     try {
+      const activeSearch = String(overrides?.search ?? search).trim();
+      const activeCategory = overrides?.category ?? category;
+      const activeDifficulty = overrides?.difficulty ?? difficulty;
       const params: Record<string, string> = { page: String(page), limit: '12' };
-      if (search) params.search = search;
-      if (category !== 'All') params.category = category;
-      if (difficulty !== 'All') params.difficulty = difficulty;
+      if (activeSearch) params.search = activeSearch;
+      if (activeCategory !== 'All') params.category = activeCategory;
+      if (activeDifficulty !== 'All') params.difficulty = activeDifficulty;
 
       const { data } = await api.get('/courses', { params });
       setCourses(data.courses);
@@ -137,6 +143,13 @@ export const CourseCatalog: React.FC = () => {
   useEffect(() => { fetchCourses(); }, [category, difficulty]);
 
   const handleSearch = (e: React.FormEvent) => { e.preventDefault(); fetchCourses(); };
+
+  const clearFilters = () => {
+    setSearch('');
+    setCategory('All');
+    setDifficulty('All');
+    fetchCourses(1, { search: '', category: 'All', difficulty: 'All' });
+  };
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -165,7 +178,7 @@ export const CourseCatalog: React.FC = () => {
           {Array(8).fill(0).map((_, i) => <Skeleton key={i} className="h-72 rounded-xl" />)}
         </div>
       ) : courses.length === 0 ? (
-        <EmptyState icon={<BookOpen size={40} />} title="No courses found" description="Try adjusting your filters" action={<Button onClick={() => { setSearch(''); setCategory('All'); setDifficulty('All'); }} variant="outline">Clear Filters</Button>} />
+        <EmptyState icon={<BookOpen size={40} />} title="No courses found" description="Try adjusting your filters" action={<Button onClick={clearFilters} variant="outline">Clear Filters</Button>} />
       ) : (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
           {courses.map(c => <CourseCard key={c._id} course={c} />)}

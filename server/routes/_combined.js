@@ -16,6 +16,11 @@ const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
 const toDirectKey = (leftId, rightId) => [String(leftId), String(rightId)].sort().join(':');
 const isChatParticipant = (chat, userId) =>
   chat.participants.some((participantId) => participantId.toString() === userId.toString());
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const toSafeRegex = (value = '') => {
+  const keyword = String(value || '').trim();
+  return keyword ? new RegExp(escapeRegex(keyword), 'i') : null;
+};
 
 // ─── Skills ───────────────────────────────────────────────────────────────────
 const skillRouter = express.Router();
@@ -148,6 +153,7 @@ discussionRouter.post('/:id/reply', protect, async (req, res, next) => {
 discussionRouter.get('/contacts', protect, async (req, res, next) => {
   try {
     const { search = '' } = req.query;
+    const searchRegex = toSafeRegex(search);
 
     const query = {
       _id: { $ne: req.user._id },
@@ -155,10 +161,10 @@ discussionRouter.get('/contacts', protect, async (req, res, next) => {
       role: { $in: ['student', 'teacher'] },
     };
 
-    if (search) {
+    if (searchRegex) {
       query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
+        { name: searchRegex },
+        { email: searchRegex },
       ];
     }
 
@@ -538,17 +544,21 @@ adminRouter.get('/stats', async (req, res, next) => {
 adminRouter.get('/users', async (req, res, next) => {
   try {
     const { page = 1, limit = 20, role, search } = req.query;
+    const pageNumber = Math.max(Number.parseInt(String(page), 10) || 1, 1);
+    const pageLimit = Math.min(Math.max(Number.parseInt(String(limit), 10) || 20, 1), 100);
+    const searchRegex = toSafeRegex(search);
     const query = {};
-    if (role) query.role = role;
-    if (search) query.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { email: { $regex: search, $options: 'i' } },
+    if (role) query.role = String(role).trim();
+    if (searchRegex) query.$or = [
+      { name: searchRegex },
+      { email: searchRegex },
     ];
+
     const [users, total] = await Promise.all([
-      User.find(query).sort('-createdAt').skip((page - 1) * limit).limit(+limit),
+      User.find(query).sort('-createdAt').skip((pageNumber - 1) * pageLimit).limit(pageLimit),
       User.countDocuments(query),
     ]);
-    res.json({ users, total });
+    res.json({ users, total, page: pageNumber, limit: pageLimit });
   } catch (err) { next(err); }
 });
 

@@ -400,11 +400,6 @@ export const LiveClassRoomPage: React.FC = () => {
         name: user.name,
         role: user.role,
       });
-
-      socket.emit('live-class:camera-state', {
-        classId,
-        cameraOn: canPublishLocalCamera,
-      });
     };
 
     const handlePresence = (event: {

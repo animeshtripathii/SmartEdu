@@ -17,8 +17,9 @@ export const AdminPanel: React.FC = () => {
 
   const fetchStats = () => api.get('/admin/stats').then(r => setStats(r.data.stats));
   const fetchUsers = (s = search, r = roleFilter) => {
+    const normalizedSearch = String(s || '').trim();
     const params: Record<string, string> = {};
-    if (s) params.search = s;
+    if (normalizedSearch) params.search = normalizedSearch;
     if (r) params.role = r;
     return api.get('/admin/users', { params }).then(res => {
       setUsers(res.data.users || []);
