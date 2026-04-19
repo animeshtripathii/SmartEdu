@@ -492,7 +492,6 @@ export const LiveClassRoomPage: React.FC = () => {
       setRemoteStreams({});
     };
   }, [
-    canPublishLocalCamera,
     classId,
     clearPeerConnections,
     fetchClassDetails,
